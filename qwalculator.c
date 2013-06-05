@@ -4,6 +4,9 @@
 #include <linux/proc_fs.h>
 #include <linux/fs.h>
 #include <asm/uaccess.h>
+#include <linux/moduleparam.h>
+#include <linux/seq_file.h>
+#include <linux/jiffies.h>
 
 #define DRIVER_AUTHOR "Eugene Gritskevich <qwaker.00@gmail.com>"
 #define DRIVER_DESC   "Calculator module"
@@ -25,9 +28,13 @@ MODULE_PARM_DESC(out, "Output file");
 static int char_dev[4] = {0, 0, 0, 0};
 static char * char_names[4] = {NULL, NULL, NULL, NULL};
 
+static char buf[512];
+
 static long var1 = 0;
 static long var2 = 0;
 static char op = '+';
+
+#define SUCCESS 0
 
 static ssize_t read_var1(struct file* fil,
                         char* buffer,
@@ -35,7 +42,20 @@ static ssize_t read_var1(struct file* fil,
                         loff_t* offset)
 {    
     long len;
-    len = sprintf(buffer, "%ld\n", var1);
+    static int finished = 0;
+ 
+    printk(KERN_INFO "read var 1\n");
+
+    if (finished) {
+        finished = 0;
+        return 0;
+    }
+    finished = 1;
+
+    len = sprintf(buf, "%ld\n", var1);
+    if (copy_to_user(buffer, buf, len)) {
+        return -EFAULT;
+    }
     return len;
 }
 
@@ -44,15 +64,15 @@ static ssize_t write_var1(struct file* fil,
                          size_t count,
                          loff_t* offset)
 {
-    char ubuffer[512];
-
+    printk(KERN_INFO "write var 1\n");
+ 
     if (count > 511) count = 511;
-    if (copy_from_user(ubuffer, buffer, count)) {
+    if (copy_from_user(buf, buffer, count)) {
         printk(KERN_ERR "Failed to write to char dev\n");
         return -EFAULT;
     }
-    ubuffer[count] = 0;
-    if (sscanf(ubuffer, "%ld", &*(long*)var1) != 1) {
+    buf[count] = 0;
+    if (sscanf(buf, "%ld", &var1) != 1) {
         printk(KERN_ERR "Long value expected\n");
         return -EFAULT;
     }
@@ -66,7 +86,18 @@ static ssize_t read_var2(struct file* fil,
                         loff_t* offset)
 {    
     long len;
-    len = sprintf(buffer, "%ld\n", var2);
+    static int finished = 0;
+
+    if (finished) {
+        finished = 0;
+        return 0;
+    }
+    finished = 1;
+
+    len = sprintf(buf, "%ld\n", var2);
+    if (copy_to_user(buffer, buf, len)) {
+        return -EFAULT;
+    }
     return len;
 }
 
@@ -75,15 +106,13 @@ static ssize_t write_var2(struct file* fil,
                          size_t count,
                          loff_t* offset)
 {
-    char ubuffer[512];
-
     if (count > 511) count = 511;
-    if (copy_from_user(ubuffer, buffer, count)) {
+    if (copy_from_user(buf, buffer, count)) {
         printk(KERN_ERR "Failed to write to char dev\n");
         return -EFAULT;
     }
-    ubuffer[count] = 0;
-    if (sscanf(ubuffer, "%ld", &*(long*)var2) != 1) {
+    buf[count] = 0;
+    if (sscanf(buf, "%ld", &var2) != 1) {
         printk(KERN_ERR "Long value expected\n");
         return -EFAULT;
     }
@@ -91,29 +120,42 @@ static ssize_t write_var2(struct file* fil,
     return count;
 }
 
-static size_t read_op(struct file* fil,
-                      char* buffer,
-                      size_t length,
-                      loff_t* offset)
-{    
-    long len;
-    len = sprintf(buffer, "%c\n", op);
-    return len;
+static ssize_t read_op(struct file* fil,
+                       char* buffer,
+                       size_t length,
+                       loff_t* offset)
+{   
+    static int finished = 0;
+    char nl = '\n';
+
+    if (finished) {
+        finished = 0;
+        return 0;
+    }
+    finished = 1;
+
+    if (copy_to_user(buffer, &op, 1)) {
+        return -EFAULT;
+    }
+    if (copy_to_user(buffer + 1, &nl, 1)) {
+        return -EFAULT;
+    }
+    return 2;
 }
 
-static size_t write_op(struct file* fil,
-                       const char* buffer,
-                       size_t count,
-                       loff_t* offset)
+static ssize_t write_op(struct file* fil,
+                        const char* buffer,
+                        size_t count,
+                        loff_t* offset)
 {
-    char ubuffer[512], new_op;
+    char new_op;
 
     if (count > 511) count = 511;
-    if (copy_from_user(ubuffer, buffer, count)) {
+    if (copy_from_user(buf, buffer, count)) {
         printk(KERN_ERR "Failed to write to char dev\n");
         return -EFAULT;
     }
-    new_op = ubuffer[0];
+    new_op = buf[0];
     if (strchr("+-/*", new_op) == NULL) {
         printk(KERN_ERR "One of '+', '-', '/', '*' expected\n");
         return -EFAULT;
@@ -123,68 +165,99 @@ static size_t write_op(struct file* fil,
     return count;
 }
 
-static size_t read_result(struct file* fil,
-                          char *buffer,
-                          size_t length,
-                          loff_t* offset)
+
+static int read_result(struct seq_file *m, void *v)
 {
-    long len = 0;
     switch (op) {
-        case '+': len = sprintf(buffer, "%ld\n", var1 + var2); break;
-        case '-': len = sprintf(buffer, "%ld\n", var1 - var2); break;
-        case '*': len = sprintf(buffer, "%ld\n", var1 * var2); break;
+        case '+': seq_printf(m, "%ld\n", var1 + var2); break;
+        case '-': seq_printf(m, "%ld\n", var1 - var2); break;
+        case '*': seq_printf(m, "%ld\n", var1 * var2); break;
         case '/':
             if (var2 == 0)
-                len = sprintf(buffer, "Division error\n");else
-                len = sprintf(buffer, "%ld\n", var1 / var2);
+                seq_printf(m, "Division error\n");else
+                seq_printf(m, "%ld\n", var1 / var2);
             break;
     }
-    return len;
+    return 0;
 }
 
-static int __init init(void)
+static int open_result(struct inode *inode, struct file *file)
+{
+    return single_open(file, read_result, NULL);
+}
+ 
+
+static int fs_open(struct inode *inode, struct file *file)
+{
+    printk(KERN_INFO "fs_open\n");
+    try_module_get(THIS_MODULE);
+    return SUCCESS;
+}
+
+static int fs_release(struct inode *inode, struct file *file)
+{
+    printk(KERN_INFO "fs_release\n");
+    module_put(THIS_MODULE);
+    return SUCCESS;
+}
+
+struct file_operations fops[4] = {
+    {
+        .owner = THIS_MODULE,
+        .open = fs_open,
+        .release = fs_release,
+        .write = write_var1,
+        .read = read_var1,
+    },
+    {
+        .owner = THIS_MODULE,
+        .open = fs_open,
+        .release = fs_release,
+        .write = write_var2,
+        .read = read_var2,
+    },
+    {
+        .owner = THIS_MODULE,
+        .open = fs_open,
+        .release = fs_release,
+        .write = write_op,
+        .read = read_op,
+    },
+    {
+        .owner = THIS_MODULE,
+        .open = open_result,
+        .read = seq_read,
+        .llseek = seq_lseek,
+        .release = single_release,
+    }
+};
+ 
+
+static int __init init( void )
 {
     int i;
-    struct file_operations fops[4];
-    memset(fops, 0, sizeof(fops));
-
-    printk(KERN_INFO "Trying to create proc files:\n");
 
     char_names[0] = inp1;
     char_names[1] = inp2;
     char_names[2] = inp3;
     char_names[3] = out;
-
-    fops[0].read = (void*)read_var1;
-    fops[0].write = (void*)write_var1;
-    fops[1].read = (void*)read_var2;
-    fops[1].write = (void*)write_var2;
-    fops[2].read = (void*)read_op;
-    fops[2].write = (void*)write_op;
-    fops[3].read = (void*)read_result;
-   
+ 
+    printk( KERN_ALERT "qwalculator module loaded\n");
     for (i = 0; i < 4; ++i) {
         char_dev[i] = register_chrdev(0, char_names[i], &fops[i]);
-        if (char_dev[i] < 0) {
-            printk(KERN_ERR "Failed to create /dev/%s", char_names[i]);
-            return -ENOMEM;
-        } else {
-            printk(KERN_INFO "/dev/%s\n", char_names[i]);
-        }
+        printk(KERN_INFO "%s = %d\n", char_names[i], char_dev[i]);
     }
+
     return 0;
 }
 
-static void __exit cleanup(void)
+static void __exit cleanup( void )
 {
     int i;
-
-    for (i = 0; i < 4; ++i) 
-        if (char_dev[i] != 0) {
-            unregister_chrdev(char_dev[i], char_names[i]);
-        }
-
-    printk(KERN_ALERT "char files removed\n");
+    for (i = 0; i < 4; ++i) {
+        unregister_chrdev(char_dev[i], char_names[i]);
+    }
+    printk(KERN_ALERT "qwalculator module is unloaded\n");
 }
 
 module_init(init);
